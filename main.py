@@ -39,8 +39,9 @@ image = (
         "fastmcp>=2.14.0,<3",
         "mcp>=1.27.0,<2",
     )
-    .add_local_python_source("garmin_session")
+    # Modal requires `.env()` before any `.add_local_*` calls.
     .env({"GIT_COMMIT": _git_sha, "GIT_DIRTY": _git_dirty})
+    .add_local_python_source("garmin_session")
 )
 
 with image.imports():

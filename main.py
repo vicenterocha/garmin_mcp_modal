@@ -1,6 +1,31 @@
 """Garmin MCP server hosted on Modal."""
 
+import subprocess
+
 import modal
+
+
+def _git_info() -> tuple[str, str]:
+    """Capture short HEAD sha and dirty flag at deploy time.
+
+    Runs locally during `modal deploy` (where `.git` exists) and bakes the
+    values into the image as env vars. Inside the container the subprocess
+    falls through to "unknown", but that fallback is unreachable in practice
+    because `image.env` has already set the values from the deploy host.
+    """
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        dirty = "1" if subprocess.check_output(
+            ["git", "status", "--porcelain"], text=True, stderr=subprocess.DEVNULL
+        ).strip() else "0"
+        return sha, dirty
+    except Exception:
+        return "unknown", "0"
+
+
+_git_sha, _git_dirty = _git_info()
 
 image = (
     modal.Image.debian_slim(python_version="3.13")
@@ -15,6 +40,7 @@ image = (
         "mcp>=1.27.0,<2",
     )
     .add_local_python_source("garmin_session")
+    .env({"GIT_COMMIT": _git_sha, "GIT_DIRTY": _git_dirty})
 )
 
 with image.imports():
@@ -89,16 +115,23 @@ def endpoint():
     # vanilla HTTPAdapter, breaking OAuth2 refresh with 429s).
     install_curl_impersonation(garmin_client.garth)
     garmin_client.login(tokenstore=tokens_base64)
-    # login()'s branchy profile-loading can leave `display_name` None (the path
-    # that reads from /socialProfile silently returns None if the field is
-    # missing). Tools build URLs like `daily/{display_name}`, so a None here
-    # turns every request into `daily/None` → 403. /userprofile/profile always
-    # carries displayName — re-fetch from there as a guard.
-    if not garmin_client.display_name:
-        prof = garmin_client.garth.connectapi("/userprofile-service/userprofile/profile")
-        if prof and isinstance(prof, dict):
-            garmin_client.display_name = prof.get("displayName")
-            garmin_client.full_name = prof.get("fullName") or garmin_client.full_name
+    # Always re-fetch from /userprofile/profile rather than trusting login()'s
+    # branchy code path — we've observed it leave display_name None when the
+    # /socialProfile branch runs and the response lacks the field. A None here
+    # makes every URL `daily/None` → 403. Hard-fail if the canonical endpoint
+    # doesn't yield a displayName so Modal restarts the container instead of
+    # serving broken state.
+    prof = garmin_client.garth.connectapi("/userprofile-service/userprofile/profile")
+    if not isinstance(prof, dict) or not prof.get("displayName"):
+        raise RuntimeError(f"Garmin profile fetch returned no displayName (got {prof!r})")
+    garmin_client.display_name = prof["displayName"]
+    garmin_client.full_name = prof.get("fullName") or garmin_client.full_name
+
+    print(
+        f"[startup] commit={os.environ.get('GIT_COMMIT', '?')} "
+        f"dirty={os.environ.get('GIT_DIRTY', '?')} "
+        f"display_name={garmin_client.display_name!r}"
+    )
 
     activity_management.configure(garmin_client)
     health_wellness.configure(garmin_client)

@@ -326,8 +326,12 @@ def endpoint():
 
 
 @app.function()
-async def test_tool(tool_name: str | None = None):
-    """Make sure that we can run tools from the MCP server."""
+async def test_tool(tool_name: str | None = None, date: str | None = None):
+    """Make sure that we can run tools from the MCP server.
+
+    `date` is forwarded as a `{"date": ...}` argument when set, for tools that
+    need a date param (most health/wellness tools).
+    """
     if tool_name is None:
         tool_name = "get_full_name"
 
@@ -340,15 +344,16 @@ async def test_tool(tool_name: str | None = None):
         headers={"Authorization": f"Bearer {bearer_token}"},
     )
     client = Client(transport)
+    args = {"date": date} if date else {}
 
     async with client:
         tools = await client.list_tools()
 
         for tool in tools:
-            print(tool)
             if tool.name == tool_name:
-                result = await client.call_tool(tool_name)
-                print(result.data)
+                print(f"calling {tool_name} with args={args}")
+                result = await client.call_tool(tool_name, args)
+                print(f"RESULT: {result.data!r}")
                 return
 
     raise Exception(f"could not find tool {tool_name}")

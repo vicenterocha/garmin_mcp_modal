@@ -21,9 +21,13 @@ def _run(*cmd: str, check: bool = True) -> str:
 
 
 def _check_clean() -> str | None:
-    out = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
-    if out.stdout.strip():
-        return f"working tree has uncommitted changes:\n{out.stdout}"
+    # `--quiet` returns 1 if there's any diff vs HEAD (tracked files only —
+    # untracked artifacts like local debug scripts don't end up in the deploy).
+    if subprocess.run(["git", "diff", "--quiet", "HEAD"]).returncode != 0:
+        diff = subprocess.run(
+            ["git", "diff", "--name-status", "HEAD"], capture_output=True, text=True
+        ).stdout
+        return f"working tree has uncommitted changes to tracked files:\n{diff}"
     return None
 
 

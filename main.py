@@ -116,17 +116,17 @@ def endpoint():
     # vanilla HTTPAdapter, breaking OAuth2 refresh with 429s).
     install_curl_impersonation(garmin_client.garth)
     garmin_client.login(tokenstore=tokens_base64)
-    # Always re-fetch from /userprofile/profile rather than trusting login()'s
-    # branchy code path — we've observed it leave display_name None when the
-    # /socialProfile branch runs and the response lacks the field. A None here
-    # makes every URL `daily/None` → 403. Hard-fail if the canonical endpoint
-    # doesn't yield a displayName so Modal restarts the container instead of
-    # serving broken state.
-    prof = garmin_client.garth.connectapi("/userprofile-service/userprofile/profile")
-    if not isinstance(prof, dict) or not prof.get("displayName"):
-        raise RuntimeError(f"Garmin profile fetch returned no displayName (got {prof!r})")
-    garmin_client.display_name = prof["displayName"]
-    garmin_client.full_name = prof.get("fullName") or garmin_client.full_name
+    # `display_name` is set inside login() via /socialProfile. If it's still
+    # None, every tool URL becomes `daily/None` → 403. Hard-fail so Modal
+    # restarts instead of serving broken state. (The earlier defensive fetch
+    # against /userprofile/profile was retired — Garmin started returning 404
+    # for that path; /socialProfile via login() remains reliable.)
+    if not garmin_client.display_name:
+        prof_keys = list((garmin_client.garth.profile or {}).keys())
+        raise RuntimeError(
+            f"Garmin login completed but display_name is unset. "
+            f"garth.profile keys: {prof_keys}"
+        )
 
     print(
         f"[startup] commit={os.environ.get('GIT_COMMIT', '?')} "

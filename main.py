@@ -85,15 +85,71 @@ app = modal.App(
     secrets=[modal.Secret.from_name("garmin-tokens"), modal.Secret.from_name("mcp-auth")],
 )
 
+# Volume holding fresh OAuth tokens, refreshed daily by `refresh_tokens` (below).
+# `endpoint()` prefers `/tokens/garmin.b64` over the bootstrap env var so that
+# token rotation doesn't require a redeploy.
+tokens_volume = modal.Volume.from_name("garmin-tokens-vol", create_if_missing=True)
+TOKENS_VOLUME_PATH = "/tokens/garmin.b64"
 
-@app.function()
+
+@app.function(
+    schedule=modal.Cron("0 4 * * *", timezone="Europe/Lisbon"),
+    secrets=[modal.Secret.from_name("garmin-creds")],
+    volumes={"/tokens": tokens_volume},
+)
+def refresh_tokens():
+    """Re-mint Garmin OAuth tokens via full SSO and persist to the volume.
+
+    Garmin's OAuth2 token has a ~24h TTL, and the exchange endpoint refuses
+    to refresh it without recent SSO context (returns 429). So we redo the
+    full email/password login daily and write the fresh `garth.dumps()` to
+    a Modal Volume that `endpoint()` reads on cold start.
+
+    If Garmin demands MFA the cron raises — in that case run `auth.py`
+    locally and `python deploy.py` to recover. (We pass `return_on_mfa=True`
+    so garth surfaces the MFA need instead of trying to call `input()`.)
+    """
+    from pathlib import Path
+
+    garmin = Garmin(
+        email=os.environ["GARMIN_EMAIL"],
+        password=os.environ["GARMIN_PASSWORD"],
+        return_on_mfa=True,
+    )
+    install_curl_impersonation(garmin.garth)
+    result = garmin.login()
+    if isinstance(result, tuple) and result[0] == "needs_mfa":
+        raise RuntimeError(
+            "Garmin demanded MFA — automated refresh blocked. "
+            "Run `auth.py` locally and `python deploy.py` to recover."
+        )
+
+    Path(TOKENS_VOLUME_PATH).write_text(garmin.garth.dumps())
+    tokens_volume.commit()
+    print(f"[refresh_tokens] wrote fresh tokens to {TOKENS_VOLUME_PATH}")
+
+
+@app.function(volumes={"/tokens": tokens_volume})
 @modal.asgi_app()
 def endpoint():
     """ASGI web endpoint for the MCP server."""
-    tokens_base64 = os.environ.get("GARMINTOKENS_BASE64")
+    # Prefer fresh tokens written daily by the `refresh_tokens` cron to the
+    # mounted volume; fall back to the bootstrap env var when the volume is
+    # empty (first deploy, before the first cron run). `reload()` picks up
+    # any commits that happened after this container's volume was mounted.
+    tokens_volume.reload()
+    tokens_source = "?"
+    if os.path.exists(TOKENS_VOLUME_PATH):
+        tokens_base64 = open(TOKENS_VOLUME_PATH).read().strip()
+        tokens_source = "volume"
+    else:
+        tokens_base64 = os.environ.get("GARMINTOKENS_BASE64")
+        tokens_source = "env"
     if not tokens_base64:
         raise RuntimeError(
-            "GARMINTOKENS_BASE64 secret is not set. Run: modal secret create garmin-tokens GARMINTOKENS_BASE64=$(cat ~/.garminconnect_base64)"
+            "No Garmin tokens available — neither /tokens/garmin.b64 nor "
+            "GARMINTOKENS_BASE64 is set. Bootstrap with: "
+            "`auth.py && modal secret create garmin-tokens GARMINTOKENS_BASE64=$(cat ~/.garminconnect_base64)`"
         )
 
     mcp_bearer_token = os.environ.get("MCP_BEARER_TOKEN")
@@ -138,6 +194,7 @@ def endpoint():
     print(
         f"[startup] commit={os.environ.get('GIT_COMMIT', '?')} "
         f"dirty={os.environ.get('GIT_DIRTY', '?')} "
+        f"tokens={tokens_source} "
         f"auth={auth_status} "
         f"display_name={garmin_client.display_name!r}"
     )

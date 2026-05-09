@@ -115,22 +115,30 @@ def endpoint():
     # `configure()` calls inside login (which would otherwise replace it with a
     # vanilla HTTPAdapter, breaking OAuth2 refresh with 429s).
     install_curl_impersonation(garmin_client.garth)
-    garmin_client.login(tokenstore=tokens_base64)
-    # `display_name` is set inside login() via /socialProfile. If it's still
-    # None, every tool URL becomes `daily/None` → 403. Hard-fail so Modal
-    # restarts instead of serving broken state. (The earlier defensive fetch
-    # against /userprofile/profile was retired — Garmin started returning 404
-    # for that path; /socialProfile via login() remains reliable.)
-    if not garmin_client.display_name:
-        prof_keys = list((garmin_client.garth.profile or {}).keys())
-        raise RuntimeError(
-            f"Garmin login completed but display_name is unset. "
-            f"garth.profile keys: {prof_keys}"
-        )
+
+    # Don't crash-loop on auth failure. If login fails (typically because the
+    # tokens in the Modal secret are >24h old and Garmin's anti-bot blocks the
+    # OAuth2 refresh exchange), let the container start in a degraded state.
+    # Tool calls will surface their own errors; the MCP server stays responsive
+    # and Modal stops retrying the container init, which would just hammer
+    # Garmin's rate limit further. Operator action: re-run auth.py + refresh
+    # the modal secret + redeploy.
+    auth_status = "ok"
+    try:
+        garmin_client.login(tokenstore=tokens_base64)
+        if not garmin_client.display_name:
+            prof_keys = list((garmin_client.garth.profile or {}).keys())
+            raise RuntimeError(
+                f"login() completed but display_name is unset. "
+                f"garth.profile keys: {prof_keys}"
+            )
+    except Exception as e:  # noqa: BLE001 — explicit broad catch, see comment above
+        auth_status = f"failed: {type(e).__name__}: {e}"
 
     print(
         f"[startup] commit={os.environ.get('GIT_COMMIT', '?')} "
         f"dirty={os.environ.get('GIT_DIRTY', '?')} "
+        f"auth={auth_status} "
         f"display_name={garmin_client.display_name!r}"
     )
 

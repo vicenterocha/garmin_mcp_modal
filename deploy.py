@@ -4,14 +4,24 @@ Wraps `modal deploy main.py` with sanity checks so we don't ship code from a
 dirty tree, the wrong branch, or a checkout that's behind origin/main. The
 last one is what burned us: a stale worktree quietly redeployed pre-fix code.
 
+Also blocks deploys when the local Garmin tokens are likely too old to survive
+container startup. Garmin's OAuth2 token has a ~24h TTL, and refreshing it via
+the exchange endpoint without recent SSO context gets 429'd by their anti-bot.
+Deploying with stale tokens means the new container can't authenticate.
+
 Usage:
     uv run python deploy.py            # enforce all checks
     uv run python deploy.py --force    # bypass all checks (emergencies)
 """
 
 import argparse
+import os
 import subprocess
 import sys
+import time
+
+TOKEN_PATH = os.path.expanduser("~/.garminconnect_base64")
+TOKEN_MAX_AGE_HOURS = 20  # Garmin OAuth2 expires at ~24h; leave headroom
 
 
 def _run(*cmd: str, check: bool = True) -> str:
@@ -46,13 +56,26 @@ def _check_up_to_date() -> str | None:
     return None
 
 
+def _check_tokens_fresh() -> str | None:
+    if not os.path.exists(TOKEN_PATH):
+        return f"{TOKEN_PATH} does not exist; run `uv run python auth.py` first"
+    age_hours = (time.time() - os.path.getmtime(TOKEN_PATH)) / 3600
+    if age_hours > TOKEN_MAX_AGE_HOURS:
+        return (
+            f"{TOKEN_PATH} is {age_hours:.1f}h old (>{TOKEN_MAX_AGE_HOURS}h). "
+            f"Run `uv run python auth.py` to refresh, then re-run deploy."
+        )
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--force", action="store_true", help="skip safety checks")
     args = parser.parse_args()
 
     if not args.force:
-        for check in (_check_clean, _check_on_main, _check_up_to_date):
+        checks = (_check_clean, _check_on_main, _check_up_to_date, _check_tokens_fresh)
+        for check in checks:
             err = check()
             if err:
                 print(f"✗ {err}", file=sys.stderr)

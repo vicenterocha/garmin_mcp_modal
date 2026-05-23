@@ -37,7 +37,7 @@ image = (
         "curl-cffi>=0.15.0",
         "fastapi>=0.136.1",
         "fastmcp>=2.14.0,<3",
-        "garminconnect==0.2.38",
+        "garminconnect==0.2.38",  # newer versions removed .garth, which we access directly
         "garth>=0.5.17",
         "mcp>=1.27.0,<2",
     )

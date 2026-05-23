@@ -39,6 +39,7 @@ class CurlCffiAdapter(HTTPAdapter):
             timeout=timeout,
             verify=verify,
             stream=stream,
+            allow_redirects=False,
         )
         r = Response()
         r.status_code = resp.status_code

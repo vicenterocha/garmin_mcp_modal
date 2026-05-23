@@ -37,6 +37,8 @@ image = (
         "curl-cffi>=0.15.0",
         "fastapi>=0.136.1",
         "fastmcp>=2.14.0,<3",
+        "garminconnect==0.2.38",
+        "garth>=0.5.17",
         "mcp>=1.27.0,<2",
     )
     # Modal requires `.env()` before any `.add_local_*` calls.
@@ -52,7 +54,7 @@ with image.imports():
     import os
     import secrets
     import time
-    from urllib.parse import urlencode
+    from urllib.parse import urlencode, urlparse
 
     from fastapi import FastAPI, Request  # ty:ignore[unresolved-import]
     from fastapi.responses import JSONResponse, RedirectResponse  # ty:ignore[unresolved-import]
@@ -72,8 +74,6 @@ with image.imports():
         workouts,
     )
     from garminconnect import Garmin
-    from mcp.server.auth.middleware.bearer_auth import AccessToken
-    from mcp.server.auth.settings import AuthSettings
     from mcp.server.fastmcp import FastMCP
     from mcp.server.fastmcp.server import TransportSecuritySettings
 
@@ -158,14 +158,6 @@ def endpoint():
             "MCP_BEARER_TOKEN secret is not set. Run: modal secret create mcp-auth MCP_BEARER_TOKEN=<your-secret>"
         )
 
-    class StaticBearerVerifier:
-        """Accepts a single static bearer token — simple cross-device auth."""
-
-        async def verify_token(self, token: str) -> AccessToken | None:
-            if token == mcp_bearer_token:
-                return AccessToken(token=token, client_id="static", scopes=[])
-            return None
-
     garmin_client = Garmin()
     # Pin a curl_cffi adapter on garth's session before login so it survives
     # `configure()` calls inside login (which would otherwise replace it with a
@@ -215,11 +207,6 @@ def endpoint():
     fast_mcp_app = FastMCP(
         "Garmin Connect v1.0",
         stateless_http=True,
-        token_verifier=StaticBearerVerifier(),
-        # AuthSettings is required whenever token_verifier is set; it tells
-        # FastMCP which OAuth issuer it should advertise to clients and which
-        # URL to use as the protected-resource identifier.
-        auth=AuthSettings(issuer_url=base_url, resource_server_url=f"{base_url}/mcp/"),
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
@@ -244,6 +231,16 @@ def endpoint():
     mcp_app = fast_mcp_app.streamable_http_app()
 
     fastapi_app = FastAPI(lifespan=mcp_app.router.lifespan_context)
+
+    @fastapi_app.middleware("http")
+    async def bearer_auth(request: Request, call_next):
+        if request.url.path.startswith("/mcp"):
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Bearer "):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+            if not hmac.compare_digest(auth.removeprefix("Bearer "), mcp_bearer_token):
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+        return await call_next(request)
 
     # ── OAuth 2.0 Authorization Code + PKCE ───────────────────────────────
     # Claude.ai's custom-connector UI only drives Authorization Code with PKCE,
@@ -300,11 +297,28 @@ def endpoint():
                 "issuer": base_url,
                 "authorization_endpoint": f"{base_url}/authorize",
                 "token_endpoint": f"{base_url}/token",
+                "registration_endpoint": f"{base_url}/register",
                 "response_types_supported": ["code"],
                 "grant_types_supported": ["authorization_code"],
                 "code_challenge_methods_supported": ["S256"],
                 "token_endpoint_auth_methods_supported": ["client_secret_post"],
             }
+        )
+
+    @fastapi_app.post("/register")
+    async def register(request: Request):
+        body = await request.json()
+        return JSONResponse(
+            {
+                "client_id": "mcp-remote",
+                "client_secret": mcp_bearer_token,
+                "client_id_issued_at": int(time.time()),
+                "token_endpoint_auth_method": "client_secret_post",
+                "grant_types": ["authorization_code"],
+                "response_types": ["code"],
+                "redirect_uris": body.get("redirect_uris", []),
+            },
+            status_code=201,
         )
 
     @fastapi_app.get("/.well-known/oauth-protected-resource/mcp")
@@ -328,7 +342,9 @@ def endpoint():
     ):
         if response_type != "code":
             return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
-        if redirect_uri not in CLAUDE_CALLBACKS:
+        parsed_uri = urlparse(redirect_uri)
+        localhost_callback = parsed_uri.scheme == "http" and parsed_uri.hostname in ("localhost", "127.0.0.1")
+        if redirect_uri not in CLAUDE_CALLBACKS and not localhost_callback:
             return JSONResponse(
                 {"error": "invalid_request", "error_description": "redirect_uri not allowed"},
                 status_code=400,

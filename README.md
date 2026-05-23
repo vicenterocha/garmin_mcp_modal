@@ -40,6 +40,16 @@ uv run modal secret create garmin-tokens GARMINTOKENS_BASE64="$(cat ~/.garmincon
 
 Tokens are valid for ~6 months. When they expire, re-run steps 2–3.
 
+### 4. Upload Garmin credentials as a Modal Secret
+
+The daily token-refresh cron (`refresh_tokens`) needs your Garmin email and password to redo the full SSO login automatically:
+
+```bash
+uv run modal secret create garmin-creds \
+  GARMIN_EMAIL="your@email.com" \
+  GARMIN_PASSWORD="yourpassword"
+```
+
 ### 5. Create an MCP bearer token
 
 Generate a random token, save it to an environment variable (so that you can read it and pass it to Claude later), and then upload it as a Modal Secret:
@@ -88,11 +98,13 @@ Add the server to `~/Library/Application Support/Claude/claude_desktop_config.js
 {
   "mcpServers": {
     "garmin": {
-      "type": "streamable-http",
-      "url": "https://<your-modal-username>--garmin-mcp-endpoint.modal.run/mcp/",
-      "headers": {
-        "Authorization": "Bearer <your-MCP_BEARER_TOKEN>"
-      }
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "https://<your-modal-username>--garmin-mcp-endpoint.modal.run/mcp/",
+        "--header",
+        "Authorization:Bearer <your-MCP_BEARER_TOKEN>"
+      ]
     }
   }
 }
